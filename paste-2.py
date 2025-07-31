@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+2D to 3D DICOM Conversion Tool - Highly Refined for Clear Bone Structure Visualization
+This script automatically loads DICOM images, processes them with advanced techniques,
+and converts them into a clear, high-quality 3D bone model.
+
+This module is designed to be imported and used by the main 2D analysis tool.
+"""
+
+import os
+import numpy as np
+import pydicom
+from skimage import measure, filters, morphology, exposure, segmentation
+import vtk
+from vtk.util import numpy_support
+import cv2
+from scipy import ndimage
+
+class DicomTo3D:
+    def __init__(self, dicom_dir):  # Fixed: __init__ instead of _init_
+        """Initialize with the directory containing DICOM files"""
+        self.dicom_dir = dicom_dir
+        self.slices = []
+        self.volume = None
+        self.spacing = None
+        # HU thresholds for bone - adjustable parameters
+        self.bone_lower = 200  # Hounsfield units for bone lower threshold
+        self.bone_upper = 3000  # Hounsfield units for bone upper threshold
+        # Smoothing parameters
+        self.smoothing_iterations = 25
+        self.smoothing_pass_band = 0.05
+        # Connectivity parameters
+        self.min_size_percent = 0.1  # % of largest component to keep
+
+    def is_dicom_file(self, filepath):
+        """Check if a file is a DICOM file"""
+        try:
+            with open(filepath, 'rb') as f:
+                # Check for DICOM magic number
+                f.seek(128)
+                magic = f.read(4)
+                return magic == b'DICM'
+        except:
+            return False
+
+    def load_dicom_series(self):
+        """Load all DICOM files from the specified directory with better error handling"""
+        if not self.dicom_dir or not os.path.exists(self.dicom_dir):
+            raise ValueError(f"Invalid DICOM directory: {self.dicom_dir}")
+
+        print(f"Loading DICOM files from {self.dicom_dir}...")
+
+        # Get list of all potential DICOM files
+        dicom_files = []
+        for root, dirs, files in os.walk(self.dicom_dir):
+            for f in files:
+                file_path = os.path.join(root, f)
+                # Try to identify DICOM files by extension or by reading
+                if (f.lower().endswith(('.dcm', '.dic', '.dicom', '.ima')) or
+                        self.is_dicom_file(file_path)):
+                    dicom_files.append(file_path)
+
+        if not dicom_files:
+            # Try all files in directory
+            for f in os.listdir(self.dicom_dir):
+                file_path = os.path.join(self.dicom_dir, f)
+                if os.path.isfile(file_path) and self.is_dicom_file(file_path):
+                    dicom_files.append(file_path)
+
+        if not dicom_files:
+            raise ValueError(f"No DICOM files found in {self.dicom_dir}")
+
+        print(f"Found {len(dicom_files)} potential DICOM files.")
+
+        # Load each DICOM file
+        valid_slices = []
+        for file_path in dicom_files:
+            try:
+                ds = pydicom.dcmread(file_path, force=True)
+                if hasattr(ds, 'pixel_array') and ds.pixel_array is not None:
+                    # Basic validation
+                    if ds.pixel_array.size > 0:
+                        valid_slices.append(ds)
+                        print(f"Loaded: {os.path.basename(file_path)}")
+            except Exception as e:
+                print(f"Error reading {os.path.basename(file_path)}: {e}")
+                continue
+
+        if not valid_slices:
+            raise ValueError("No valid DICOM slices were loaded.")
+
+        # Sort slices by instance number or slice location to ensure proper 3D ordering
+        try:
+            valid_slices.sort(key=lambda x: float(x.InstanceNumber) if hasattr(x, 'InstanceNumber') else 0)
+        except:
+            try:
+                valid_slices.sort(key=lambda x: float(x.SliceLocation) if hasattr(x, 'SliceLocation') else 0)
+            except:
+                print("Warning: Could not sort slices by position")
+
+        self.slices = valid_slices
+        print(f"Successfully loaded {len(self.slices)} valid DICOM slices.")
+
+        if not self.slices:
+            raise ValueError("No valid DICOM slices were loaded.")
+
+    def process_volume(self):
+        """Convert DICOM slices to a 3D volume with proper Hounsfield Units"""
+        print("Processing DICOM slices into 3D volume...")
+
+        # Get slice dimensions
+        img_shape = self.slices[0].pixel_array.shape
+
+        # Create 3D volume array
+        self.volume = np.zeros((img_shape[0], img_shape[1], len(self.slices)))
+
+        # Get pixel spacing information
+        pixel_spacing = self.slices[0].PixelSpacing if hasattr(self.slices[0], 'PixelSpacing') else [1, 1]
+        slice_thickness = self.slices[0].SliceThickness if hasattr(self.slices[0], 'SliceThickness') else 1
+
+        self.spacing = [pixel_spacing[0], pixel_spacing[1], slice_thickness]
+        print(f"Volume spacing: {self.spacing}")
+
+        # Fill the 3D volume with slice data and convert to Hounsfield Units
+        for i, slice_data in enumerate(self.slices):
+            # Get pixel data
+            pixel_array = slice_data.pixel_array.astype(np.int16)
+
+            # Convert to Hounsfield Units (HU) if needed
+            if hasattr(slice_data, 'RescaleIntercept') and hasattr(slice_data, 'RescaleSlope'):
+                intercept = slice_data.RescaleIntercept
+                slope = slice_data.RescaleSlope
+                hu_image = pixel_array * slope + intercept
+            else:
+                # If rescale parameters are not available, use raw values
+                hu_image = pixel_array
+
+            self.volume[:, :, i] = hu_image
+
+        print(f"Volume dimensions: {self.volume.shape}")
+        print(f"Volume value range: [{np.min(self.volume)}, {np.max(self.volume)}]")
+
+        # Apply anisotropic diffusion filter to enhance boundaries while reducing noise
+        print("Applying anisotropic diffusion filter...")
+        self.volume = ndimage.gaussian_filter(self.volume, sigma=0.8)
+
+    def segment_bone(self):
+        """Segment the volume to isolate bone structures using advanced techniques"""
+        print("Segmenting volume to isolate bone structures...")
+
+        # Create a binary mask where bone structures are located
+        print(f"Using bone HU threshold range: [{self.bone_lower}, {self.bone_upper}]")
+        bone_mask = np.logical_and(self.volume >= self.bone_lower, self.volume <= self.bone_upper)
+
+        # Apply 3D morphological operations to improve connectivity
+        print("Applying 3D morphological operations...")
+
+        # First, remove very small noise particles
+        bone_mask = morphology.remove_small_objects(bone_mask, min_size=100)
+
+        # Apply closing to connect nearby structures (bridge small gaps)
+        structure = ndimage.generate_binary_structure(3, 2)  # 3D connectivity
+        bone_mask = ndimage.binary_closing(bone_mask, structure=structure, iterations=3)
+
+        # Fill holes in 3D
+        bone_mask = ndimage.binary_fill_holes(bone_mask)
+
+        # Keep only the largest connected components to remove isolated fragments
+        print("Keeping only significant connected components...")
+        labels, num_labels = ndimage.label(bone_mask)
+        if num_labels > 0:
+            # Calculate sizes of all labeled regions
+            sizes = np.bincount(labels.ravel())
+            sizes[0] = 0  # Ignore background
+
+            # Find size of largest component
+            max_size = sizes.max()
+
+            # Keep only components that are at least min_size_percent of the largest one
+            min_keep_size = int(max_size * self.min_size_percent)
+            for i in range(1, num_labels + 1):
+                if sizes[i] < min_keep_size:
+                    bone_mask[labels == i] = 0
+
+        # Convert back to uint8 for VTK compatibility
+        self.volume = bone_mask.astype(np.uint8) * 255
+        print("Enhanced bone segmentation complete.")
+
+    def create_3d_model(self):
+        """Create a high-quality 3D model from the segmented volume using VTK"""
+        print("Creating high-quality 3D bone model...")
+
+        if self.volume is None:
+            print("No volume data available. Please load and process DICOM data first.")
+            return
+
+        # Create VTK image data
+        vtk_data = vtk.vtkImageData()
+        vtk_data.SetDimensions(self.volume.shape[0], self.volume.shape[1], self.volume.shape[2])
+        vtk_data.SetSpacing(self.spacing)
+        vtk_data.SetOrigin(0, 0, 0)
+
+        # Flatten the numpy array and convert to VTK array
+        flat_data = self.volume.transpose(2, 1, 0).flatten()
+        vtk_array = numpy_support.numpy_to_vtk(flat_data)
+        vtk_data.GetPointData().SetScalars(vtk_array)
+
+        # Create isosurface using marching cubes
+        print("Extracting surface with Marching Cubes algorithm...")
+        surface = vtk.vtkMarchingCubes()
+        surface.SetInputData(vtk_data)
+        surface.SetValue(0, 127)  # Set middle threshold for binary volume
+        surface.ComputeNormalsOn()
+        surface.Update()
+
+        # Create smoother surface with enhanced parameters
+        print(f"Smoothing surface mesh (iterations: {self.smoothing_iterations}, pass band: {self.smoothing_pass_band})...")
+        smoother = vtk.vtkWindowedSincPolyDataFilter()
+        smoother.SetInputConnection(surface.GetOutputPort())
+        smoother.SetNumberOfIterations(self.smoothing_iterations)
+        smoother.SetPassBand(self.smoothing_pass_band)
+        smoother.BoundarySmoothingOn()
+        smoother.FeatureEdgeSmoothingOff()
+        smoother.NonManifoldSmoothingOn()
+        smoother.NormalizeCoordinatesOn()
+        smoother.Update()
+
+        # Optional: Decimate to reduce polygon count while preserving detail
+        print("Optimizing mesh with decimation...")
+        decimate = vtk.vtkDecimatePro()
+        decimate.SetInputConnection(smoother.GetOutputPort())
+        decimate.SetTargetReduction(0.1)  # Reduce point count by 10%
+        decimate.PreserveTopologyOn()
+        decimate.Update()
+
+        # Create mapper
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(decimate.GetOutputPort())
+        mapper.ScalarVisibilityOff()
+
+        # Create actor with enhanced appearance
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.95, 0.9, 0.8)  # Realistic bone color
+        actor.GetProperty().SetSpecular(0.4)
+        actor.GetProperty().SetSpecularPower(15)
+        actor.GetProperty().SetAmbient(0.2)
+        actor.GetProperty().SetDiffuse(0.8)
+
+        # Add outline for better depth perception
+        outline = vtk.vtkOutlineFilter()
+        outline.SetInputConnection(decimate.GetOutputPort())
+        outlineMapper = vtk.vtkPolyDataMapper()
+        outlineMapper.SetInputConnection(outline.GetOutputPort())
+        outlineActor = vtk.vtkActor()
+        outlineActor.SetMapper(outlineMapper)
+        outlineActor.GetProperty().SetColor(0.1, 0.1, 0.1)
+        outlineActor.GetProperty().SetLineWidth(1)
+
+        # Create renderer with improved lighting
+        renderer = vtk.vtkRenderer()
+        renderer.AddActor(actor)
+        renderer.AddActor(outlineActor)
+        renderer.SetBackground(0.05, 0.05, 0.15)  # Deep blue background
+
+        # Set up better lighting
+        light1 = vtk.vtkLight()
+        light1.SetIntensity(0.8)
+        light1.SetPosition(1, 1, 1)
+        light1.SetColor(1, 1, 1)
+        light1.SetLightTypeToCameraLight()
+
+        light2 = vtk.vtkLight()
+        light2.SetIntensity(0.5)
+        light2.SetPosition(-1, -1, -1)
+        light2.SetColor(0.8, 0.8, 1.0)
+        light2.SetLightTypeToCameraLight()
+
+        renderer.AddLight(light1)
+        renderer.AddLight(light2)
+
+        # Create render window
+        render_window = vtk.vtkRenderWindow()
+        render_window.AddRenderer(renderer)
+        render_window.SetSize(1024, 768)  # Higher resolution
+        render_window.SetWindowName("High-Quality 3D Bone Visualization - Connected from 2D Module")
+
+        # Create interactor
+        interactor = vtk.vtkRenderWindowInteractor()
+        interactor.SetRenderWindow(render_window)
+
+        # Add camera controls
+        style = vtk.vtkInteractorStyleTrackballCamera()
+        interactor.SetInteractorStyle(style)
+
+        # Reset camera and set view
+        renderer.ResetCamera()
+        camera = renderer.GetActiveCamera()
+        camera.Elevation(30)
+        camera.Azimuth(30)
+        camera.Dolly(1.5)
+        renderer.ResetCameraClippingRange()
+
+        print("High-quality 3D bone model created. Opening visualization window...")
+        render_window.Render()
+        interactor.Start()
+
+    def run(self):
+        """Complete workflow for DICOM to 3D bone conversion"""
+        try:
+            print("Starting DICOM to high-quality 3D bone structure conversion process...")
+            self.load_dicom_series()
+            self.process_volume()
+            self.segment_bone()
+            self.create_3d_model()
+            print("3D visualization process completed successfully.")
+        except Exception as e:
+            print(f"Error during 3D reconstruction: {e}")
+
+
+def main():
+    # DICOM directory path
+    dicom_dir = r"D:\5th sem notes\MINORPROJECTSENGINERRING\3dconstructions\dicom"
+
+    # Check if the directory exists
+    if not os.path.exists(dicom_dir):
+        print(f"Error: Directory {dicom_dir} does not exist.")
+        return
+
+    # Create converter and run
+    converter = DicomTo3D(dicom_dir)
+
+    # You can adjust these parameters based on your data
+    # converter.bone_lower = 150  # Lower threshold for bone in HU (decrease for more sensitivity)
+    # converter.bone_upper = 3000  # Upper threshold for bone in HU
+    # converter.smoothing_iterations = 30  # More iterations = smoother surface (try 15-50)
+    # converter.smoothing_pass_band = 0.05  # Lower values = smoother surface (try 0.01-0.1)
+    # converter.min_size_percent = 0.05  # Keep components at least 5% the size of largest one
+
+    converter.run()
+
+
+if __name__ == "__main__":  # Fixed: __name__ and __main__ instead of _name_ and _main_
+    main()
